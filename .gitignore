@@ -217,3 +217,10 @@ __marimo__/
 
 # Cache
 **/data_cache/
+
+# Pipeline / run outputs (local only)
+results/
+y/
+
+# Optional: keep one sample for CI/docs (uncomment to track)
+# !results/.gitkeep

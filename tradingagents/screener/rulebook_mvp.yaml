@@ -1,0 +1,17 @@
+version: mvp-v1
+hard_filters:
+  min_change_pct: 5.0
+  exclude_st: true
+  main_board_only: true
+  max_3d_mdd_pct: -8.0
+weights:
+  position_score: 0.2
+  trend_score: 0.2
+  volume_score: 0.2
+  breakout_score: 0.15
+  style_score: 0.1
+  concept_score: 0.15
+applied_rule_notes:
+- id: rule_20260218190452_01
+  title: 强化回撤过滤
+  suggestion: 建议在粗筛阶段新增高波动剔除条件，并提高量能持续性门槛（例如vol_ratio下限上调）。

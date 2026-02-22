@@ -1,7 +1,53 @@
+from __future__ import annotations
+
 import questionary
-from typing import List, Optional, Tuple, Dict
+from typing import List, Optional, Tuple, Dict, Any
 
 from cli.models import AnalystType
+
+# Max characters per chunk for translation to avoid context limits
+TRANSLATE_CHUNK_SIZE = 10000
+
+TRANSLATE_SYSTEM_PROMPT = """你是一个专业翻译助手。将用户提供的英文金融/股票分析报告翻译成简体中文。
+要求：
+1. 保持 Markdown 格式不变（标题、列表、表格、加粗等）。
+2. 数字、百分比、股票代码、日期、指标名称（如 SMA、EMA、MACD、RSI）保持原样或使用通用译法。
+3. 专业术语可保留英文并括号注释中文，或直接使用中文惯用译法。
+4. 只输出翻译结果，不要添加说明或前缀。"""
+
+
+def translate_to_chinese(llm: Any, text: str, chunk_size: int = TRANSLATE_CHUNK_SIZE) -> str:
+    """使用 LLM 将英文报告内容翻译成简体中文。过长内容会分块翻译后拼接。"""
+    if not text or not str(text).strip():
+        return text
+    text = str(text).strip()
+    if len(text) <= chunk_size:
+        return _translate_chunk(llm, text)
+    parts = []
+    start = 0
+    while start < len(text):
+        end = min(start + chunk_size, len(text))
+        # 尽量在段落边界处截断
+        if end < len(text):
+            last_nl = text.rfind("\n\n", start, end + 1)
+            if last_nl > start:
+                end = last_nl + 2
+        chunk = text[start:end]
+        parts.append(_translate_chunk(llm, chunk))
+        start = end
+    return "\n\n".join(parts)
+
+
+def _translate_chunk(llm: Any, chunk: str) -> str:
+    """翻译单块文本。"""
+    try:
+        messages = [("system", TRANSLATE_SYSTEM_PROMPT), ("human", chunk)]
+        result = llm.invoke(messages)
+        out = result.content if hasattr(result, "content") else str(result)
+        return (out or chunk).strip()
+    except Exception:
+        return chunk
+
 
 ANALYST_ORDER = [
     ("Market Analyst", AnalystType.MARKET),

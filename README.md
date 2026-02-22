@@ -198,6 +198,8 @@ print(decision)
 
 See `tradingagents/default_config.py` for all configuration options.
 
+For a concise **project layout** (dataflows, analyzer, pipelines, scripts) and the China A screener/story pipeline (A→B→C), see [docs/PROJECT_STRUCTURE.md](docs/PROJECT_STRUCTURE.md).
+
 ## Contributing
 
 We welcome contributions from the community! Whether it's fixing a bug, improving documentation, or suggesting a new feature, your input helps make this project better. If you are interested in this line of research, please consider joining our open-source financial AI research community [Tauric Research](https://tauric.ai/).

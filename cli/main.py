@@ -1,6 +1,10 @@
+from __future__ import annotations
+
 from typing import Optional
 import datetime
 import typer
+import questionary
+import sys
 from pathlib import Path
 from functools import wraps
 from rich.console import Console
@@ -25,6 +29,8 @@ from rich.rule import Rule
 
 from tradingagents.graph.trading_graph import TradingAgentsGraph
 from tradingagents.default_config import DEFAULT_CONFIG
+from tradingagents.pipelines import run_stock_analysis_pipeline, run_iteration_pipeline
+from tradingagents.iteration import set_proposal_status, apply_accepted_proposals
 from cli.models import AnalystType
 from cli.utils import *
 from cli.announcements import fetch_announcements, display_announcements
@@ -36,6 +42,8 @@ app = typer.Typer(
     name="TradingAgents",
     help="TradingAgents CLI: Multi-Agents LLM Financial Trading Framework",
     add_completion=True,  # Enable shell completion
+    invoke_without_command=True,
+    no_args_is_help=False,
 )
 
 
@@ -501,10 +509,23 @@ def get_user_selections():
     # Step 1: Ticker symbol
     console.print(
         create_question_box(
-            "Step 1: Ticker Symbol", "Enter the ticker symbol to analyze", "SPY"
+            "Step 1: Ticker Symbol",
+            "Enter the ticker symbol to analyze (US: SPY, AAPL  |  A-share: 601869, 000001)",
+            "SPY",
         )
     )
     selected_ticker = get_ticker()
+
+    # Detect market type from ticker
+    from tradingagents.utils.stock_utils import get_market_type
+    market_type = get_market_type(selected_ticker)
+    if market_type == "china_a":
+        console.print(
+            f"[bold yellow]Detected China A-share market for {selected_ticker}[/bold yellow]"
+        )
+        console.print(
+            "[dim]Sentiment & Social Media analysts will be disabled for A-shares.[/dim]"
+        )
 
     # Step 2: Analysis date
     default_date = datetime.datetime.now().strftime("%Y-%m-%d")
@@ -518,12 +539,24 @@ def get_user_selections():
     analysis_date = get_analysis_date()
 
     # Step 3: Select analysts
-    console.print(
-        create_question_box(
-            "Step 3: Analysts Team", "Select your LLM analyst agents for the analysis"
+    if market_type == "china_a":
+        # A-shares: force-select only market, news, fundamentals (no social/sentiment)
+        from cli.models import AnalystType
+        selected_analysts = [AnalystType.MARKET, AnalystType.NEWS, AnalystType.FUNDAMENTALS]
+        console.print(
+            create_question_box(
+                "Step 3: Analysts Team",
+                "A-share mode: Sentiment & Social Media analysts disabled.\n"
+                "Auto-selected: Market, News, Fundamentals",
+            )
         )
-    )
-    selected_analysts = select_analysts()
+    else:
+        console.print(
+            create_question_box(
+                "Step 3: Analysts Team", "Select your LLM analyst agents for the analysis"
+            )
+        )
+        selected_analysts = select_analysts()
     console.print(
         f"[green]Selected analysts:[/green] {', '.join(analyst.value for analyst in selected_analysts)}"
     )
@@ -586,6 +619,7 @@ def get_user_selections():
         "deep_thinker": selected_deep_thinker,
         "google_thinking_level": thinking_level,
         "openai_reasoning_effort": reasoning_effort,
+        "market_type": market_type,
     }
 
 
@@ -613,155 +647,256 @@ def get_analysis_date():
             )
 
 
-def save_report_to_disk(final_state, ticker: str, save_path: Path):
-    """Save complete analysis report to disk with organized subfolders."""
+# 中文报告标题（report_language="zh" 时使用）
+_REPORT_LABELS_ZH = {
+    "report_title": "完整分析报告",
+    "save_report_title": "交易分析报告",
+    "generated": "生成时间",
+    "I_analysts": "一、分析师团队报告",
+    "II_research": "二、研究团队决策",
+    "III_trading": "三、交易团队计划",
+    "IV_risk": "四、风险管理团队决策",
+    "V_portfolio": "五、投资组合经理决策",
+    "Market Analyst": "市场分析师",
+    "Social Analyst": "社交/舆情分析师",
+    "News Analyst": "新闻分析师",
+    "Fundamentals Analyst": "基本面分析师",
+    "Bull Researcher": "多头研究员",
+    "Bear Researcher": "空头研究员",
+    "Research Manager": "研究经理",
+    "Trader": "交易员",
+    "Aggressive Analyst": "激进分析师",
+    "Conservative Analyst": "保守分析师",
+    "Neutral Analyst": "中性分析师",
+    "Portfolio Manager": "投资组合经理",
+}
+
+# 英文标题（未翻译时使用）
+_REPORT_LABELS_EN = {
+    "report_title": "Complete Analysis Report",
+    "save_report_title": "Trading Analysis Report",
+    "generated": "Generated",
+    "I_analysts": "I. Analyst Team Reports",
+    "II_research": "II. Research Team Decision",
+    "III_trading": "III. Trading Team Plan",
+    "IV_risk": "IV. Risk Management Team Decision",
+    "V_portfolio": "V. Portfolio Manager Decision",
+    "Market Analyst": "Market Analyst",
+    "Social Analyst": "Social Analyst",
+    "News Analyst": "News Analyst",
+    "Fundamentals Analyst": "Fundamentals Analyst",
+    "Bull Researcher": "Bull Researcher",
+    "Bear Researcher": "Bear Researcher",
+    "Research Manager": "Research Manager",
+    "Trader": "Trader",
+    "Aggressive Analyst": "Aggressive Analyst",
+    "Conservative Analyst": "Conservative Analyst",
+    "Neutral Analyst": "Neutral Analyst",
+    "Portfolio Manager": "Portfolio Manager",
+}
+
+
+def _translate_final_state_to_chinese(llm, final_state):
+    """将 final_state 中所有报告类文本字段翻译成中文，返回新字典（不修改原 state）。"""
+    import copy
+    from cli.utils import translate_to_chinese
+    state = copy.deepcopy(final_state)
+    if state.get("market_report"):
+        state["market_report"] = translate_to_chinese(llm, state["market_report"])
+    if state.get("sentiment_report"):
+        state["sentiment_report"] = translate_to_chinese(llm, state["sentiment_report"])
+    if state.get("news_report"):
+        state["news_report"] = translate_to_chinese(llm, state["news_report"])
+    if state.get("fundamentals_report"):
+        state["fundamentals_report"] = translate_to_chinese(llm, state["fundamentals_report"])
+    if state.get("investment_debate_state"):
+        ideb = state["investment_debate_state"]
+        if ideb.get("bull_history"):
+            ideb["bull_history"] = translate_to_chinese(llm, ideb["bull_history"])
+        if ideb.get("bear_history"):
+            ideb["bear_history"] = translate_to_chinese(llm, ideb["bear_history"])
+        if ideb.get("judge_decision"):
+            ideb["judge_decision"] = translate_to_chinese(llm, ideb["judge_decision"])
+    if state.get("trader_investment_plan"):
+        state["trader_investment_plan"] = translate_to_chinese(llm, state["trader_investment_plan"])
+    if state.get("risk_debate_state"):
+        rdeb = state["risk_debate_state"]
+        if rdeb.get("aggressive_history"):
+            rdeb["aggressive_history"] = translate_to_chinese(llm, rdeb["aggressive_history"])
+        if rdeb.get("conservative_history"):
+            rdeb["conservative_history"] = translate_to_chinese(llm, rdeb["conservative_history"])
+        if rdeb.get("neutral_history"):
+            rdeb["neutral_history"] = translate_to_chinese(llm, rdeb["neutral_history"])
+        if rdeb.get("judge_decision"):
+            rdeb["judge_decision"] = translate_to_chinese(llm, rdeb["judge_decision"])
+    if state.get("final_trade_decision"):
+        state["final_trade_decision"] = translate_to_chinese(llm, state["final_trade_decision"])
+    return state
+
+
+def save_report_to_disk(final_state, ticker: str, save_path: Path, llm=None, report_language: str = "zh"):
+    """Save complete analysis report to disk with organized subfolders. When report_language is 'zh' and llm is provided, content is translated to Chinese."""
     save_path.mkdir(parents=True, exist_ok=True)
+    use_zh = report_language == "zh" and llm is not None
+    if use_zh:
+        console.print("[dim]正在将报告翻译成中文并保存…[/dim]")
+        state = _translate_final_state_to_chinese(llm, final_state)
+    else:
+        state = final_state
+
+    labels = _REPORT_LABELS_ZH if use_zh else _REPORT_LABELS_EN
+    def L(key):
+        return labels.get(key, key)
+
     sections = []
 
     # 1. Analysts
     analysts_dir = save_path / "1_analysts"
     analyst_parts = []
-    if final_state.get("market_report"):
+    if state.get("market_report"):
         analysts_dir.mkdir(exist_ok=True)
-        (analysts_dir / "market.md").write_text(final_state["market_report"])
-        analyst_parts.append(("Market Analyst", final_state["market_report"]))
-    if final_state.get("sentiment_report"):
+        (analysts_dir / "market.md").write_text(state["market_report"])
+        analyst_parts.append((L("Market Analyst"), state["market_report"]))
+    if state.get("sentiment_report"):
         analysts_dir.mkdir(exist_ok=True)
-        (analysts_dir / "sentiment.md").write_text(final_state["sentiment_report"])
-        analyst_parts.append(("Social Analyst", final_state["sentiment_report"]))
-    if final_state.get("news_report"):
+        (analysts_dir / "sentiment.md").write_text(state["sentiment_report"])
+        analyst_parts.append((L("Social Analyst"), state["sentiment_report"]))
+    if state.get("news_report"):
         analysts_dir.mkdir(exist_ok=True)
-        (analysts_dir / "news.md").write_text(final_state["news_report"])
-        analyst_parts.append(("News Analyst", final_state["news_report"]))
-    if final_state.get("fundamentals_report"):
+        (analysts_dir / "news.md").write_text(state["news_report"])
+        analyst_parts.append((L("News Analyst"), state["news_report"]))
+    if state.get("fundamentals_report"):
         analysts_dir.mkdir(exist_ok=True)
-        (analysts_dir / "fundamentals.md").write_text(final_state["fundamentals_report"])
-        analyst_parts.append(("Fundamentals Analyst", final_state["fundamentals_report"]))
+        (analysts_dir / "fundamentals.md").write_text(state["fundamentals_report"])
+        analyst_parts.append((L("Fundamentals Analyst"), state["fundamentals_report"]))
     if analyst_parts:
         content = "\n\n".join(f"### {name}\n{text}" for name, text in analyst_parts)
-        sections.append(f"## I. Analyst Team Reports\n\n{content}")
+        sections.append(f"## {L('I_analysts')}\n\n{content}")
 
     # 2. Research
-    if final_state.get("investment_debate_state"):
+    if state.get("investment_debate_state"):
         research_dir = save_path / "2_research"
-        debate = final_state["investment_debate_state"]
+        debate = state["investment_debate_state"]
         research_parts = []
         if debate.get("bull_history"):
             research_dir.mkdir(exist_ok=True)
             (research_dir / "bull.md").write_text(debate["bull_history"])
-            research_parts.append(("Bull Researcher", debate["bull_history"]))
+            research_parts.append((L("Bull Researcher"), debate["bull_history"]))
         if debate.get("bear_history"):
             research_dir.mkdir(exist_ok=True)
             (research_dir / "bear.md").write_text(debate["bear_history"])
-            research_parts.append(("Bear Researcher", debate["bear_history"]))
+            research_parts.append((L("Bear Researcher"), debate["bear_history"]))
         if debate.get("judge_decision"):
             research_dir.mkdir(exist_ok=True)
             (research_dir / "manager.md").write_text(debate["judge_decision"])
-            research_parts.append(("Research Manager", debate["judge_decision"]))
+            research_parts.append((L("Research Manager"), debate["judge_decision"]))
         if research_parts:
             content = "\n\n".join(f"### {name}\n{text}" for name, text in research_parts)
-            sections.append(f"## II. Research Team Decision\n\n{content}")
+            sections.append(f"## {L('II_research')}\n\n{content}")
 
     # 3. Trading
-    if final_state.get("trader_investment_plan"):
+    if state.get("trader_investment_plan"):
         trading_dir = save_path / "3_trading"
         trading_dir.mkdir(exist_ok=True)
-        (trading_dir / "trader.md").write_text(final_state["trader_investment_plan"])
-        sections.append(f"## III. Trading Team Plan\n\n### Trader\n{final_state['trader_investment_plan']}")
+        (trading_dir / "trader.md").write_text(state["trader_investment_plan"])
+        sections.append(f"## {L('III_trading')}\n\n### {L('Trader')}\n{state['trader_investment_plan']}")
 
     # 4. Risk Management
-    if final_state.get("risk_debate_state"):
+    if state.get("risk_debate_state"):
         risk_dir = save_path / "4_risk"
-        risk = final_state["risk_debate_state"]
+        risk = state["risk_debate_state"]
         risk_parts = []
         if risk.get("aggressive_history"):
             risk_dir.mkdir(exist_ok=True)
             (risk_dir / "aggressive.md").write_text(risk["aggressive_history"])
-            risk_parts.append(("Aggressive Analyst", risk["aggressive_history"]))
+            risk_parts.append((L("Aggressive Analyst"), risk["aggressive_history"]))
         if risk.get("conservative_history"):
             risk_dir.mkdir(exist_ok=True)
             (risk_dir / "conservative.md").write_text(risk["conservative_history"])
-            risk_parts.append(("Conservative Analyst", risk["conservative_history"]))
+            risk_parts.append((L("Conservative Analyst"), risk["conservative_history"]))
         if risk.get("neutral_history"):
             risk_dir.mkdir(exist_ok=True)
             (risk_dir / "neutral.md").write_text(risk["neutral_history"])
-            risk_parts.append(("Neutral Analyst", risk["neutral_history"]))
+            risk_parts.append((L("Neutral Analyst"), risk["neutral_history"]))
         if risk_parts:
             content = "\n\n".join(f"### {name}\n{text}" for name, text in risk_parts)
-            sections.append(f"## IV. Risk Management Team Decision\n\n{content}")
+            sections.append(f"## {L('IV_risk')}\n\n{content}")
 
-        # 5. Portfolio Manager
         if risk.get("judge_decision"):
             portfolio_dir = save_path / "5_portfolio"
             portfolio_dir.mkdir(exist_ok=True)
             (portfolio_dir / "decision.md").write_text(risk["judge_decision"])
-            sections.append(f"## V. Portfolio Manager Decision\n\n### Portfolio Manager\n{risk['judge_decision']}")
+            sections.append(f"## {L('V_portfolio')}\n\n### {L('Portfolio Manager')}\n{risk['judge_decision']}")
 
-    # Write consolidated report
-    header = f"# Trading Analysis Report: {ticker}\n\nGenerated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+    header = f"# {L('save_report_title')}：{ticker}\n\n{L('generated')}：{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n" if use_zh else f"# Trading Analysis Report: {ticker}\n\nGenerated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
     (save_path / "complete_report.md").write_text(header + "\n\n".join(sections))
     return save_path / "complete_report.md"
 
 
-def display_complete_report(final_state):
-    """Display the complete analysis report sequentially (avoids truncation)."""
-    console.print()
-    console.print(Rule("Complete Analysis Report", style="bold green"))
+def display_complete_report(final_state, llm=None, report_language: str = "zh"):
+    """Display the complete analysis report sequentially. When report_language is 'zh' and llm is provided, content is translated to Chinese."""
+    use_zh = report_language == "zh" and llm is not None
+    if use_zh:
+        console.print("[dim]正在将报告翻译成中文并显示…[/dim]")
+        state = _translate_final_state_to_chinese(llm, final_state)
+    else:
+        state = final_state
 
-    # I. Analyst Team Reports
+    labels = _REPORT_LABELS_ZH if use_zh else _REPORT_LABELS_EN
+    def L(key):
+        return labels.get(key, key)
+
+    console.print()
+    console.print(Rule(L("report_title"), style="bold green"))
+
     analysts = []
-    if final_state.get("market_report"):
-        analysts.append(("Market Analyst", final_state["market_report"]))
-    if final_state.get("sentiment_report"):
-        analysts.append(("Social Analyst", final_state["sentiment_report"]))
-    if final_state.get("news_report"):
-        analysts.append(("News Analyst", final_state["news_report"]))
-    if final_state.get("fundamentals_report"):
-        analysts.append(("Fundamentals Analyst", final_state["fundamentals_report"]))
+    if state.get("market_report"):
+        analysts.append((L("Market Analyst"), state["market_report"]))
+    if state.get("sentiment_report"):
+        analysts.append((L("Social Analyst"), state["sentiment_report"]))
+    if state.get("news_report"):
+        analysts.append((L("News Analyst"), state["news_report"]))
+    if state.get("fundamentals_report"):
+        analysts.append((L("Fundamentals Analyst"), state["fundamentals_report"]))
     if analysts:
-        console.print(Panel("[bold]I. Analyst Team Reports[/bold]", border_style="cyan"))
+        console.print(Panel(f"[bold]{L('I_analysts')}[/bold]", border_style="cyan"))
         for title, content in analysts:
             console.print(Panel(Markdown(content), title=title, border_style="blue", padding=(1, 2)))
 
-    # II. Research Team Reports
-    if final_state.get("investment_debate_state"):
-        debate = final_state["investment_debate_state"]
+    if state.get("investment_debate_state"):
+        debate = state["investment_debate_state"]
         research = []
         if debate.get("bull_history"):
-            research.append(("Bull Researcher", debate["bull_history"]))
+            research.append((L("Bull Researcher"), debate["bull_history"]))
         if debate.get("bear_history"):
-            research.append(("Bear Researcher", debate["bear_history"]))
+            research.append((L("Bear Researcher"), debate["bear_history"]))
         if debate.get("judge_decision"):
-            research.append(("Research Manager", debate["judge_decision"]))
+            research.append((L("Research Manager"), debate["judge_decision"]))
         if research:
-            console.print(Panel("[bold]II. Research Team Decision[/bold]", border_style="magenta"))
+            console.print(Panel(f"[bold]{L('II_research')}[/bold]", border_style="magenta"))
             for title, content in research:
                 console.print(Panel(Markdown(content), title=title, border_style="blue", padding=(1, 2)))
 
-    # III. Trading Team
-    if final_state.get("trader_investment_plan"):
-        console.print(Panel("[bold]III. Trading Team Plan[/bold]", border_style="yellow"))
-        console.print(Panel(Markdown(final_state["trader_investment_plan"]), title="Trader", border_style="blue", padding=(1, 2)))
+    if state.get("trader_investment_plan"):
+        console.print(Panel(f"[bold]{L('III_trading')}[/bold]", border_style="yellow"))
+        console.print(Panel(Markdown(state["trader_investment_plan"]), title=L("Trader"), border_style="blue", padding=(1, 2)))
 
-    # IV. Risk Management Team
-    if final_state.get("risk_debate_state"):
-        risk = final_state["risk_debate_state"]
+    if state.get("risk_debate_state"):
+        risk = state["risk_debate_state"]
         risk_reports = []
         if risk.get("aggressive_history"):
-            risk_reports.append(("Aggressive Analyst", risk["aggressive_history"]))
+            risk_reports.append((L("Aggressive Analyst"), risk["aggressive_history"]))
         if risk.get("conservative_history"):
-            risk_reports.append(("Conservative Analyst", risk["conservative_history"]))
+            risk_reports.append((L("Conservative Analyst"), risk["conservative_history"]))
         if risk.get("neutral_history"):
-            risk_reports.append(("Neutral Analyst", risk["neutral_history"]))
+            risk_reports.append((L("Neutral Analyst"), risk["neutral_history"]))
         if risk_reports:
-            console.print(Panel("[bold]IV. Risk Management Team Decision[/bold]", border_style="red"))
+            console.print(Panel(f"[bold]{L('IV_risk')}[/bold]", border_style="red"))
             for title, content in risk_reports:
                 console.print(Panel(Markdown(content), title=title, border_style="blue", padding=(1, 2)))
-
-        # V. Portfolio Manager Decision
         if risk.get("judge_decision"):
-            console.print(Panel("[bold]V. Portfolio Manager Decision[/bold]", border_style="green"))
-            console.print(Panel(Markdown(risk["judge_decision"]), title="Portfolio Manager", border_style="blue", padding=(1, 2)))
+            console.print(Panel(f"[bold]{L('V_portfolio')}[/bold]", border_style="green"))
+            console.print(Panel(Markdown(risk["judge_decision"]), title=L("Portfolio Manager"), border_style="blue", padding=(1, 2)))
 
 
 def update_research_team_status(status):
@@ -911,6 +1046,8 @@ def run_analysis():
     # Provider-specific thinking configuration
     config["google_thinking_level"] = selections.get("google_thinking_level")
     config["openai_reasoning_effort"] = selections.get("openai_reasoning_effort")
+    # Market type (china_a or us)
+    config["market_type"] = selections.get("market_type", "us")
 
     # Create stats callback handler for tracking LLM/tool calls
     stats_handler = StatsCallbackHandler()
@@ -1155,7 +1292,10 @@ def run_analysis():
         ).strip()
         save_path = Path(save_path_str)
         try:
-            report_file = save_report_to_disk(final_state, selections["ticker"], save_path)
+            report_file = save_report_to_disk(
+                final_state, selections["ticker"], save_path,
+                llm=graph.quick_thinking_llm, report_language="zh"
+            )
             console.print(f"\n[green]✓ Report saved to:[/green] {save_path.resolve()}")
             console.print(f"  [dim]Complete report:[/dim] {report_file.name}")
         except Exception as e:
@@ -1164,13 +1304,515 @@ def run_analysis():
     # Prompt to display full report
     display_choice = typer.prompt("\nDisplay full report on screen?", default="Y").strip().upper()
     if display_choice in ("Y", "YES", ""):
-        display_complete_report(final_state)
+        display_complete_report(final_state, llm=graph.quick_thinking_llm, report_language="zh")
 
 
 @app.command()
 def analyze():
     run_analysis()
 
+
+@app.command("screen-analyze")
+def screen_analyze(
+    trade_date: str = typer.Option(
+        default=datetime.datetime.now().strftime("%Y-%m-%d"),
+        help="交易日，格式 YYYY-MM-DD",
+    ),
+    top_n: int = typer.Option(default=30, min=5, max=100, help="兼容参数（纯净模式下不做TopN截断）"),
+    initial_n: int = typer.Option(default=10, min=1, max=30, help="兼容参数（纯净模式下不做数量截断）"),
+    min_change_pct: float = typer.Option(default=5.0, help="涨幅阈值(%)"),
+    max_universe: int = typer.Option(default=400, min=5, max=3000, help="最大候选池数量（试跑两层故事可用5）"),
+    use_ai: bool = typer.Option(default=True, help="是否启用AI精筛"),
+    story_mode: str = typer.Option(
+        default="simple",
+        help="故事性分析模式: simple=关键词热度, two_layer=叙事生成+时间轴+故事卡合成",
+    ),
+):
+    """运行A股股票分析系统：粗筛 -> 板块分析 -> AI精筛。"""
+    config = DEFAULT_CONFIG.copy()
+    config["market_type"] = "china_a"
+
+    stock_cfg = dict(config.get("stock_analysis", {}))
+    stock_cfg["top_n_coarse"] = top_n
+    stock_cfg["top_n_fine"] = initial_n
+    stock_cfg["min_change_pct"] = min_change_pct
+    stock_cfg["max_universe"] = max_universe
+    stock_cfg["enable_ai"] = use_ai
+    stock_cfg["story_analysis_mode"] = story_mode if story_mode in ("simple", "two_layer") else "simple"
+    config["stock_analysis"] = stock_cfg
+
+    console.print("[bold cyan]Running stock analysis pipeline...[/bold cyan]")
+    try:
+        result = run_stock_analysis_pipeline(
+            config=config,
+            trade_date=trade_date,
+            top_n=top_n,
+            initial_n=initial_n,
+            min_change_pct=min_change_pct,
+            max_universe=max_universe,
+            enable_ai=use_ai,
+        )
+        output_dir = result["output_dir"]
+        final_count = len(result["C"].get("analysis_list", []))
+        console.print(f"[green]Done. Output directory:[/green] {output_dir}")
+        console.print(f"[green]Final analyzed count:[/green] {final_count}")
+        if result.get("trace_log_path"):
+            console.print(f"[green]Trace log:[/green] {result.get('trace_log_path')}")
+    except Exception as exc:
+        console.print(f"[red]Execution failed:[/red] {exc}")
+        raise typer.Exit(code=1)
+
+
+@app.command("track-iterate")
+def track_iterate(
+    trade_date: str = typer.Option(
+        default=datetime.datetime.now().strftime("%Y-%m-%d"),
+        help="交易日，格式 YYYY-MM-DD",
+    ),
+    lookback_days: int = typer.Option(default=3, min=1, max=10, help="回看天数（默认3）"),
+):
+    """运行股票迭代系统：3天追踪 -> 复盘建议 -> 补丁候选池。"""
+    config = DEFAULT_CONFIG.copy()
+    config["market_type"] = "china_a"
+    iter_cfg = dict(config.get("iteration", {}))
+    iter_cfg["lookback_days"] = lookback_days
+    config["iteration"] = iter_cfg
+
+    console.print("[bold cyan]Running iteration pipeline...[/bold cyan]")
+    try:
+        result = run_iteration_pipeline(
+            config=config,
+            trade_date=trade_date,
+            lookback_days=lookback_days,
+        )
+        output_dir = result["output_dir"]
+        tracked = int(result["D"].get("target_count", 0))
+        proposals = len(result["E"].get("added_to_pool", []))
+        console.print(f"[green]Done. Output directory:[/green] {output_dir}")
+        console.print(f"[green]Tracked symbols:[/green] {tracked}")
+        console.print(f"[green]Patch proposals added:[/green] {proposals}")
+        if result.get("trace_log_path"):
+            console.print(f"[green]Trace log:[/green] {result.get('trace_log_path')}")
+    except Exception as exc:
+        console.print(f"[red]Execution failed:[/red] {exc}")
+        raise typer.Exit(code=1)
+
+
+@app.command("patch-status")
+def patch_status(
+    ids: str = typer.Option(..., help="补丁ID，逗号分隔"),
+    status: str = typer.Option(..., help="目标状态: proposed|accepted|rejected"),
+):
+    """更新补丁候选池状态（人工采纳/拒绝）。"""
+    try:
+        id_list = [x.strip() for x in ids.split(",") if x.strip()]
+        pool_path = Path(DEFAULT_CONFIG["results_dir"]) / "iteration" / "patch_pool.json"
+        updated = set_proposal_status(pool_path=pool_path, proposal_ids=id_list, status=status)
+        console.print(f"[green]Updated proposals:[/green] {len(updated)}")
+    except Exception as exc:
+        console.print(f"[red]Execution failed:[/red] {exc}")
+        raise typer.Exit(code=1)
+
+
+@app.command("patch-apply")
+def patch_apply():
+    """将已accepted的补丁应用到规则表与Prompt。"""
+    try:
+        pool_path = Path(DEFAULT_CONFIG["results_dir"]) / "iteration" / "patch_pool.json"
+        stock_cfg = DEFAULT_CONFIG.get("stock_analysis", {})
+        rulebook_path = Path(stock_cfg.get("rulebook_path") or "tradingagents/screener/rulebook_mvp.yaml")
+        prompt_path = Path(stock_cfg.get("prompt_path") or "tradingagents/analyzer/prompts/stock_analysis_prompt_cn.md")
+        result = apply_accepted_proposals(
+            pool_path=pool_path,
+            rulebook_path=rulebook_path,
+            prompt_path=prompt_path,
+        )
+        console.print(f"[green]Applied rule patches:[/green] {len(result.get('applied_rule_ids', []))}")
+        console.print(f"[green]Applied prompt patches:[/green] {len(result.get('applied_prompt_ids', []))}")
+        console.print(f"[green]Rulebook:[/green] {result.get('rulebook_path')}")
+        console.print(f"[green]Prompt:[/green] {result.get('prompt_path')}")
+    except Exception as exc:
+        console.print(f"[red]Execution failed:[/red] {exc}")
+        raise typer.Exit(code=1)
+
+
+@app.command("daily-run")
+def daily_run(
+    trade_date: str = typer.Option(
+        default=datetime.datetime.now().strftime("%Y-%m-%d"),
+        help="交易日，格式 YYYY-MM-DD",
+    ),
+    use_ai: bool = typer.Option(default=True, help="是否启用AI精筛"),
+    story_mode: str = typer.Option(
+        default="simple",
+        help="故事性分析: simple 或 two_layer（叙事+故事卡）",
+    ),
+    top_n: int = typer.Option(default=30, min=5, max=100, help="兼容参数（纯净模式下不做TopN截断）"),
+    initial_n: int = typer.Option(default=10, min=1, max=30, help="兼容参数（纯净模式下不做数量截断）"),
+    max_universe: int = typer.Option(default=400, min=50, max=3000, help="最大候选池数量"),
+):
+    """MVP编排：先跑筛选分析，再跑迭代复盘。"""
+    config = DEFAULT_CONFIG.copy()
+    config["market_type"] = "china_a"
+    stock_cfg = dict(config.get("stock_analysis", {}))
+    stock_cfg["story_analysis_mode"] = story_mode if story_mode in ("simple", "two_layer") else "simple"
+    config["stock_analysis"] = stock_cfg
+    console.print("[bold cyan]Running daily orchestrator...[/bold cyan]")
+    try:
+        sr = run_stock_analysis_pipeline(
+            config=config,
+            trade_date=trade_date,
+            top_n=top_n,
+            initial_n=initial_n,
+            max_universe=max_universe,
+            enable_ai=use_ai,
+            min_change_pct=float(config.get("stock_analysis", {}).get("min_change_pct", 5.0)),
+        )
+        ir = run_iteration_pipeline(
+            config=config,
+            trade_date=trade_date,
+            lookback_days=int(config.get("iteration", {}).get("lookback_days", 3)),
+        )
+        console.print(f"[green]Screening output:[/green] {sr.get('output_dir')}")
+        if sr.get("trace_log_path"):
+            console.print(f"[green]Screening trace:[/green] {sr.get('trace_log_path')}")
+        console.print(f"[green]Iteration output:[/green] {ir.get('output_dir')}")
+        if ir.get("trace_log_path"):
+            console.print(f"[green]Iteration trace:[/green] {ir.get('trace_log_path')}")
+        console.print("[green]Daily run done.[/green]")
+    except Exception as exc:
+        console.print(f"[red]Execution failed:[/red] {exc}")
+        raise typer.Exit(code=1)
+
+
+def _load_json_safe(path: Path) -> dict:
+    import json
+
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+@app.command("dashboard")
+def dashboard(
+    trade_date: str = typer.Option(
+        default=datetime.datetime.now().strftime("%Y-%m-%d"),
+        help="交易日，格式 YYYY-MM-DD",
+    ),
+):
+    """CLI可视化面板（MVP）：展示筛选与迭代关键指标。"""
+    root = Path(DEFAULT_CONFIG["results_dir"])
+    a = _load_json_safe(root / "screener" / trade_date / "A_candidates.json")
+    b = _load_json_safe(root / "screener" / trade_date / "B_sector_calibration.json")
+    c = _load_json_safe(root / "screener" / trade_date / "C_ai_analysis_with_cards.json")
+    d = _load_json_safe(root / "iteration" / trade_date / "D_tracking_metrics.json")
+    e = _load_json_safe(root / "iteration" / trade_date / "E_patch_proposals.json")
+
+    console.print(Panel(f"[bold]Trading Dashboard[/bold]\nDate: {trade_date}", border_style="cyan"))
+
+    summary = Table(title="Summary", box=box.SIMPLE)
+    summary.add_column("Metric")
+    summary.add_column("Value")
+    summary.add_row("A Top Count", str(a.get("count", 0)))
+    summary.add_row("B Sector Count", str(len(b.get("calibrated_analysis_list", []))))
+    summary.add_row("C Analysis Count", str(len(c.get("analysis_list", []))))
+    summary.add_row("D Tracking Count", str(d.get("target_count", 0)))
+    summary.add_row("E Rule Patches", str(len(e.get("rule_patch_suggestions", []))))
+    summary.add_row("E Prompt Patches", str(len(e.get("prompt_patch_suggestions", []))))
+    console.print(summary)
+
+    top_table = Table(title="Top Picks (Calibrated)", box=box.MINIMAL_DOUBLE_HEAD)
+    top_table.add_column("Symbol")
+    top_table.add_column("Name")
+    top_table.add_column("Multiplier")
+    top_table.add_column("Sector")
+    top_table.add_column("Leader")
+    for item in (
+        b.get("calibrated_analysis_list", [])[:5] if isinstance(b.get("calibrated_analysis_list"), list) else []
+    ):
+        top_table.add_row(
+            str(item.get("symbol", "")),
+            str(item.get("name", "")),
+            str(item.get("sector_multiplier", "")),
+            str(item.get("sector", "")),
+            str(item.get("sector_leader_status", "")),
+        )
+    console.print(top_table)
+
+    track_table = Table(title="Tracking Snapshot", box=box.MINIMAL)
+    track_table.add_column("Symbol")
+    track_table.add_column("T+1")
+    track_table.add_column("MDD3D")
+    track_table.add_column("Reason")
+    for item in (d.get("tracking_metrics", [])[:8] if isinstance(d.get("tracking_metrics"), list) else []):
+        track_table.add_row(
+            str(item.get("symbol", "")),
+            str(item.get("t1_return_pct", "")),
+            str(item.get("mdd_3d_pct", "")),
+            str(item.get("reason_t1", ""))[:36],
+        )
+    console.print(track_table)
+
+
+def _ask_text(message: str, default: str) -> str:
+    value = questionary.text(message, default=default).ask()
+    if value is None:
+        raise typer.Abort()
+    return str(value).strip() or default
+
+
+def _ask_int(message: str, default: int, minimum: int, maximum: int) -> int:
+    while True:
+        value = _ask_text(message, str(default))
+        try:
+            parsed = int(value)
+        except ValueError:
+            console.print("[red]请输入整数。[/red]")
+            continue
+        if parsed < minimum or parsed > maximum:
+            console.print(f"[red]请输入范围 {minimum} ~ {maximum}。[/red]")
+            continue
+        return parsed
+
+
+def _ask_float(message: str, default: float) -> float:
+    while True:
+        value = _ask_text(message, str(default))
+        try:
+            return float(value)
+        except ValueError:
+            console.print("[red]请输入数字。[/red]")
+
+
+def _ask_confirm(message: str, default: bool = True) -> bool:
+    value = questionary.confirm(message, default=default).ask()
+    if value is None:
+        raise typer.Abort()
+    return bool(value)
+
+
+def _interactive_patch_review() -> None:
+    pool_path = Path(DEFAULT_CONFIG["results_dir"]) / "iteration" / "patch_pool.json"
+    pool = _load_json_safe(pool_path)
+    proposals = pool.get("proposals", []) if isinstance(pool, dict) else []
+    if not proposals:
+        console.print("[yellow]补丁池为空，请先执行 track-iterate。[/yellow]")
+        return
+
+    status_filter = questionary.select(
+        "选择要查看的补丁状态：",
+        choices=[
+            questionary.Choice("proposed（待处理）", "proposed"),
+            questionary.Choice("accepted（已采纳）", "accepted"),
+            questionary.Choice("rejected（已拒绝）", "rejected"),
+            questionary.Choice("全部", "all"),
+        ],
+    ).ask()
+    if status_filter is None:
+        raise typer.Abort()
+
+    filtered = []
+    for p in proposals:
+        if status_filter == "all" or p.get("status") == status_filter:
+            filtered.append(p)
+    if not filtered:
+        console.print("[yellow]当前筛选下没有补丁。[/yellow]")
+        return
+
+    choices = []
+    for p in filtered:
+        label = (
+            f"{p.get('id')} | {p.get('type')} | {p.get('status')} | "
+            f"{p.get('trade_date')} | {p.get('title')}"
+        )
+        choices.append(questionary.Choice(title=label, value=str(p.get("id"))))
+
+    selected_ids = questionary.checkbox(
+        "选择要更新状态的补丁（空格多选）：",
+        choices=choices,
+        instruction="Space 多选, Enter 确认",
+    ).ask()
+    if selected_ids is None:
+        raise typer.Abort()
+    if not selected_ids:
+        console.print("[yellow]未选择补丁。[/yellow]")
+        return
+
+    target_status = questionary.select(
+        "将选中补丁更新为：",
+        choices=[
+            questionary.Choice("accepted（采纳）", "accepted"),
+            questionary.Choice("rejected（拒绝）", "rejected"),
+            questionary.Choice("proposed（恢复待处理）", "proposed"),
+        ],
+    ).ask()
+    if target_status is None:
+        raise typer.Abort()
+
+    updated = set_proposal_status(
+        pool_path=pool_path,
+        proposal_ids=list(selected_ids),
+        status=str(target_status),
+    )
+    console.print(f"[green]已更新补丁数量:[/green] {len(updated)}")
+
+    if str(target_status) == "accepted" and _ask_confirm("是否立即应用已采纳补丁？", default=True):
+        patch_apply()
+
+
+def _interactive_show_decision_card() -> None:
+    trade_date = _ask_text("输入交易日（YYYY-MM-DD）", datetime.datetime.now().strftime("%Y-%m-%d"))
+    b_path = Path(DEFAULT_CONFIG["results_dir"]) / "screener" / trade_date / "C_ai_analysis_with_cards.json"
+    payload = _load_json_safe(b_path)
+    cards = payload.get("decision_cards", []) if isinstance(payload, dict) else []
+    if not cards:
+        console.print(f"[yellow]未找到决策卡文件或内容为空: {b_path}[/yellow]")
+        return
+
+    choices = []
+    for c in cards:
+        symbol = str(c.get("symbol", ""))
+        name = str(c.get("name", ""))
+        choices.append(questionary.Choice(f"{symbol} {name}", symbol))
+
+    selected_symbol = questionary.select("选择要查看的股票：", choices=choices).ask()
+    if selected_symbol is None:
+        raise typer.Abort()
+
+    card_map = payload.get("decision_card_5lines", {})
+    chosen = next((c for c in cards if str(c.get("symbol")) == str(selected_symbol)), None)
+    if not chosen:
+        console.print("[yellow]未找到选中股票数据。[/yellow]")
+        return
+
+    title = f"{chosen.get('symbol')} {chosen.get('name', '')}"
+    lines = [
+        "- 分析模式: 全量分析（无截断）",
+        "",
+        str(card_map.get(str(selected_symbol), "无5行决策卡内容")),
+    ]
+    console.print(Panel("\n".join(lines), title=title, border_style="cyan"))
+
+
+@app.command("interactive")
+def interactive():
+    """交互式工作台：在 shell 菜单中完成功能选择、股票查看、补丁采纳与应用。"""
+    console.print(Panel("[bold green]TradingAgents 交互工作台[/bold green]", border_style="green"))
+    while True:
+        action = questionary.select(
+            "请选择操作：",
+            choices=[
+                questionary.Choice("运行股票分析系统（screen-analyze）", "screen"),
+                questionary.Choice("运行股票迭代系统（track-iterate）", "iterate"),
+                questionary.Choice("一键日常流程（daily-run）", "daily"),
+                questionary.Choice("查看仪表盘（dashboard）", "dashboard"),
+                questionary.Choice("查看某日个股决策卡（选股票）", "card"),
+                questionary.Choice("补丁采纳/拒绝（patch-status）", "patch_review"),
+                questionary.Choice("应用已采纳补丁（patch-apply）", "patch_apply"),
+                questionary.Choice("运行单票完整分析（analyze）", "analyze"),
+                questionary.Choice("退出", "exit"),
+            ],
+        ).ask()
+        if action is None:
+            raise typer.Abort()
+
+        if action == "exit":
+            console.print("[green]已退出交互工作台。[/green]")
+            return
+
+        if action == "screen":
+            trade_date = _ask_text("交易日（YYYY-MM-DD）", datetime.datetime.now().strftime("%Y-%m-%d"))
+            top_n = _ask_int("粗筛 TopN", 30, 5, 100)
+            initial_n = _ask_int("精筛初选上限", 10, 1, 30)
+            min_change_pct = _ask_float("涨幅阈值(%)", 5.0)
+            max_universe = _ask_int("最大候选池数量", 400, 50, 3000)
+            use_ai = _ask_confirm("启用 AI 精筛？", default=True)
+            story_choice = questionary.select(
+                "故事性分析模式：",
+                choices=[
+                    questionary.Choice("simple（关键词热度）", "simple"),
+                    questionary.Choice("two_layer（叙事+时间轴+故事卡，含概念/主故事A-B）", "two_layer"),
+                ],
+                default="simple",
+            ).ask()
+            story_mode = story_choice if story_choice in ("simple", "two_layer") else "simple"
+            screen_analyze(
+                trade_date=trade_date,
+                top_n=top_n,
+                initial_n=initial_n,
+                min_change_pct=min_change_pct,
+                max_universe=max_universe,
+                use_ai=use_ai,
+                story_mode=story_mode,
+            )
+            continue
+
+        if action == "iterate":
+            trade_date = _ask_text("交易日（YYYY-MM-DD）", datetime.datetime.now().strftime("%Y-%m-%d"))
+            lookback_days = _ask_int("回看天数", 3, 1, 10)
+            track_iterate(trade_date=trade_date, lookback_days=lookback_days)
+            continue
+
+        if action == "daily":
+            trade_date = _ask_text("交易日（YYYY-MM-DD）", datetime.datetime.now().strftime("%Y-%m-%d"))
+            use_ai = _ask_confirm("启用 AI 精筛？", default=True)
+            story_choice = questionary.select(
+                "故事性分析模式：",
+                choices=[
+                    questionary.Choice("simple", "simple"),
+                    questionary.Choice("two_layer（叙事+故事卡）", "two_layer"),
+                ],
+                default="simple",
+            ).ask()
+            story_mode = story_choice if story_choice in ("simple", "two_layer") else "simple"
+            top_n = _ask_int("粗筛 TopN", 30, 5, 100)
+            initial_n = _ask_int("精筛初选上限", 10, 1, 30)
+            max_universe = _ask_int("最大候选池数量", 400, 50, 3000)
+            daily_run(
+                trade_date=trade_date,
+                use_ai=use_ai,
+                story_mode=story_mode,
+                top_n=top_n,
+                initial_n=initial_n,
+                max_universe=max_universe,
+            )
+            continue
+
+        if action == "dashboard":
+            trade_date = _ask_text("交易日（YYYY-MM-DD）", datetime.datetime.now().strftime("%Y-%m-%d"))
+            dashboard(trade_date=trade_date)
+            continue
+
+        if action == "card":
+            _interactive_show_decision_card()
+            continue
+
+        if action == "patch_review":
+            _interactive_patch_review()
+            continue
+
+        if action == "patch_apply":
+            patch_apply()
+            continue
+
+        if action == "analyze":
+            run_analysis()
+            continue
+
+
+@app.callback(invoke_without_command=True)
+def _default_entry(ctx: typer.Context):
+    """默认入口：无子命令时进入交互式工作台。"""
+    if ctx.invoked_subcommand is None:
+        # In non-interactive environments (no real tty), avoid crashing questionary.
+        if not sys.stdin.isatty():
+            console.print("[yellow]检测到非交互终端，已回退为帮助模式。[/yellow]")
+            console.print(ctx.get_help())
+            raise typer.Exit(code=0)
+        interactive()
 
 if __name__ == "__main__":
     app()

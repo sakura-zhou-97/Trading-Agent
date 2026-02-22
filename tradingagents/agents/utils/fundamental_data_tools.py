@@ -1,6 +1,11 @@
 from langchain_core.tools import tool
 from typing import Annotated
-from tradingagents.dataflows.interface import route_to_vendor
+from tradingagents.dataflows.interface import (
+    route_by_market_fundamentals,
+    route_by_market_balance_sheet,
+    route_by_market_cashflow,
+    route_by_market_income_statement,
+)
 
 
 @tool
@@ -10,14 +15,14 @@ def get_fundamentals(
 ) -> str:
     """
     Retrieve comprehensive fundamental data for a given ticker symbol.
-    Uses the configured fundamental_data vendor.
+    Automatically routes to China A-share sources for 6-digit codes.
     Args:
-        ticker (str): Ticker symbol of the company
-        curr_date (str): Current date you are trading at, yyyy-mm-dd
+        ticker (str): Ticker symbol, e.g. AAPL, 601869
+        curr_date (str): Current date, yyyy-mm-dd
     Returns:
         str: A formatted report containing comprehensive fundamental data
     """
-    return route_to_vendor("get_fundamentals", ticker, curr_date)
+    return route_by_market_fundamentals(ticker, curr_date)
 
 
 @tool
@@ -28,15 +33,14 @@ def get_balance_sheet(
 ) -> str:
     """
     Retrieve balance sheet data for a given ticker symbol.
-    Uses the configured fundamental_data vendor.
     Args:
-        ticker (str): Ticker symbol of the company
+        ticker (str): Ticker symbol, e.g. AAPL, 601869
         freq (str): Reporting frequency: annual/quarterly (default quarterly)
-        curr_date (str): Current date you are trading at, yyyy-mm-dd
+        curr_date (str): Current date, yyyy-mm-dd
     Returns:
         str: A formatted report containing balance sheet data
     """
-    return route_to_vendor("get_balance_sheet", ticker, freq, curr_date)
+    return route_by_market_balance_sheet(ticker, freq, curr_date)
 
 
 @tool
@@ -47,15 +51,14 @@ def get_cashflow(
 ) -> str:
     """
     Retrieve cash flow statement data for a given ticker symbol.
-    Uses the configured fundamental_data vendor.
     Args:
-        ticker (str): Ticker symbol of the company
+        ticker (str): Ticker symbol, e.g. AAPL, 601869
         freq (str): Reporting frequency: annual/quarterly (default quarterly)
-        curr_date (str): Current date you are trading at, yyyy-mm-dd
+        curr_date (str): Current date, yyyy-mm-dd
     Returns:
         str: A formatted report containing cash flow statement data
     """
-    return route_to_vendor("get_cashflow", ticker, freq, curr_date)
+    return route_by_market_cashflow(ticker, freq, curr_date)
 
 
 @tool
@@ -66,12 +69,11 @@ def get_income_statement(
 ) -> str:
     """
     Retrieve income statement data for a given ticker symbol.
-    Uses the configured fundamental_data vendor.
     Args:
-        ticker (str): Ticker symbol of the company
+        ticker (str): Ticker symbol, e.g. AAPL, 601869
         freq (str): Reporting frequency: annual/quarterly (default quarterly)
-        curr_date (str): Current date you are trading at, yyyy-mm-dd
+        curr_date (str): Current date, yyyy-mm-dd
     Returns:
         str: A formatted report containing income statement data
     """
-    return route_to_vendor("get_income_statement", ticker, freq, curr_date)
+    return route_by_market_income_statement(ticker, freq, curr_date)

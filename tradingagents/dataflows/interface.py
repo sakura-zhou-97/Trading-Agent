@@ -160,3 +160,67 @@ def route_to_vendor(method: str, *args, **kwargs):
             continue  # Only rate limits trigger fallback
 
     raise RuntimeError(f"No available vendor for '{method}'")
+
+
+# ---------------------------------------------------------------------------
+# Market-aware routing (China A-share vs US)
+# ---------------------------------------------------------------------------
+
+from tradingagents.utils.stock_utils import is_china_a_stock  # noqa: E402
+
+# China A-share unified provider (lazy import to avoid hard dep when not used)
+def _china():
+    from tradingagents.dataflows.china import china_provider
+    return china_provider
+
+
+def route_by_market_stock_data(symbol: str, start_date: str, end_date: str) -> str:
+    """Get OHLCV data — routes to China provider for A-shares, else US vendor."""
+    if is_china_a_stock(symbol):
+        return _china().get_china_stock_data(symbol, start_date, end_date)
+    return route_to_vendor("get_stock_data", symbol, start_date, end_date)
+
+
+def route_by_market_fundamentals(ticker: str, curr_date: str = None) -> str:
+    if is_china_a_stock(ticker):
+        return _china().get_china_fundamentals(ticker, curr_date)
+    return route_to_vendor("get_fundamentals", ticker, curr_date)
+
+
+def route_by_market_balance_sheet(ticker: str, freq: str = "quarterly", curr_date: str = None) -> str:
+    if is_china_a_stock(ticker):
+        return _china().get_china_balance_sheet(ticker, freq, curr_date)
+    return route_to_vendor("get_balance_sheet", ticker, freq, curr_date)
+
+
+def route_by_market_cashflow(ticker: str, freq: str = "quarterly", curr_date: str = None) -> str:
+    if is_china_a_stock(ticker):
+        return _china().get_china_cashflow(ticker, freq, curr_date)
+    return route_to_vendor("get_cashflow", ticker, freq, curr_date)
+
+
+def route_by_market_income_statement(ticker: str, freq: str = "quarterly", curr_date: str = None) -> str:
+    if is_china_a_stock(ticker):
+        return _china().get_china_income_statement(ticker, freq, curr_date)
+    return route_to_vendor("get_income_statement", ticker, freq, curr_date)
+
+
+def route_by_market_news(ticker: str, start_date: str, end_date: str) -> str:
+    if is_china_a_stock(ticker):
+        return _china().get_china_news(ticker, start_date, end_date)
+    return route_to_vendor("get_news", ticker, start_date, end_date)
+
+
+def route_by_market_concepts(ticker: str, concept_keywords: list = None) -> list:
+    """Return list of concept/theme names that include this stock (e.g. ['机器人概念']). China A only."""
+    if is_china_a_stock(ticker):
+        return _china().get_china_stock_concepts(ticker, concept_keywords)
+    return []
+
+
+def route_by_market_global_news(curr_date: str, look_back_days: int = 7, limit: int = 5) -> str:
+    """Global news — check config market_type; if china_a use China provider."""
+    config = get_config()
+    if config.get("market_type") == "china_a":
+        return _china().get_china_global_news(curr_date, look_back_days, limit)
+    return route_to_vendor("get_global_news", curr_date, look_back_days, limit)
