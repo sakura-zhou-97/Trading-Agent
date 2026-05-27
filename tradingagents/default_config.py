@@ -48,6 +48,24 @@ DEFAULT_CONFIG = {
         "rulebook_path": "",
         "prompt_path": "tradingagents/analyzer/prompts/stock_analysis_prompt_cn.md",
         "story_analysis_mode": "simple",
+        "market_environment": {
+            "enabled": True,
+            "defensive_blocks_new_positions": True,
+        },
+        "opportunity_scoring": {
+            "enabled": True,
+            "min_plan_grade": "A",
+            "scoring_profile": "v1_default",
+        },
+        "trade_planning": {
+            "enabled": True,
+            "default_holding_period": "3-10 trading days",
+            "max_single_position_pct": 0.15,
+        },
+        "daily_report": {
+            "enabled": True,
+            "formats": ["json", "md"],
+        },
     },
     "iteration": {
         "lookback_days": 3,

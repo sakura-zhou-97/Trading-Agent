@@ -1,5 +1,6 @@
 from .tracker import load_tracking_targets, track_three_day_metrics
 from .review_engine import (
+    evaluate_forward_groups,
     generate_patch_suggestions,
     render_daily_review_card,
     generate_ai_review_suggestions,
@@ -9,6 +10,7 @@ from .patch_pool import append_proposals, set_proposal_status, apply_accepted_pr
 __all__ = [
     "load_tracking_targets",
     "track_three_day_metrics",
+    "evaluate_forward_groups",
     "generate_patch_suggestions",
     "render_daily_review_card",
     "generate_ai_review_suggestions",

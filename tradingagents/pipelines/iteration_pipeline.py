@@ -27,13 +27,28 @@ def _write_json(path: Path, obj: Dict) -> None:
 
 
 def _render_tracking_md(result_d: Dict) -> str:
-    lines = ["# D. 3天追踪指标", ""]
+    lines = ["# D. 前向验证指标", ""]
     for item in result_d.get("tracking_metrics", []):
         lines.append(
             f"- {item.get('symbol')} {item.get('name','')} | 源日期={item.get('source_trade_date')} | "
             f"T+1={item.get('t1_return_pct')}% | T+2={item.get('t2_return_pct')}% | T+3={item.get('t3_return_pct')}% | "
-            f"MDD={item.get('mdd_3d_pct')}% | 剔除={item.get('should_remove')}"
+            f"F5={item.get('future_5d_return_pct')}% | F10={item.get('future_10d_return_pct')}% | "
+            f"F20={item.get('future_20d_return_pct')}% | MaxGain={item.get('max_gain_pct')}% | "
+            f"MaxDD={item.get('max_drawdown_pct')}% | Entry={item.get('entry_triggered')} | "
+            f"Grade={item.get('opportunity_grade')} | Strategy={item.get('strategy_type')} | 剔除={item.get('should_remove')}"
         )
+    group_summary = result_d.get("forward_group_summary", {})
+    if group_summary:
+        lines.extend(["", "## 分组前向验证"])
+        for field, rows in group_summary.items():
+            lines.append(f"### {field}")
+            for row in rows[:5]:
+                lines.append(
+                    f"- {row.get('group')}: n={row.get('count')}, "
+                    f"avg5d={row.get('avg_future_5d_return_pct')}, "
+                    f"avg10d={row.get('avg_future_10d_return_pct')}, "
+                    f"mdd={row.get('avg_max_drawdown_pct')}"
+                )
     return "\n".join(lines) + "\n"
 
 
@@ -86,6 +101,7 @@ def _build_iteration_trace_log(
                 "metrics_count": len(metrics),
                 "tracking_metrics": metrics,
                 "summary": summary_payload.get("summary", {}),
+                "forward_group_summary": summary_payload.get("forward_group_summary", {}),
             },
         },
         "step_2_review_suggestions": {
@@ -130,9 +146,17 @@ def _render_iteration_trace_md(trace_log: Dict) -> str:
         lines.append(
             f"- {m.get('symbol')} {m.get('name', '')} | T+1={m.get('t1_return_pct')} | "
             f"T+2={m.get('t2_return_pct')} | T+3={m.get('t3_return_pct')} | "
+            f"F5={m.get('future_5d_return_pct')} | F10={m.get('future_10d_return_pct')} | "
+            f"F20={m.get('future_20d_return_pct')} | MaxDD={m.get('max_drawdown_pct')} | "
+            f"entry={m.get('entry_triggered')} | grade={m.get('opportunity_grade')} | "
             f"MDD3D={m.get('mdd_3d_pct')} | remove={m.get('should_remove')} | "
             f"reason={m.get('remove_reason', '')}"
         )
+    group_summary = s1.get("output", {}).get("forward_group_summary", {})
+    if group_summary:
+        lines.extend(["", "### 分组验证摘要"])
+        for field, rows in group_summary.items():
+            lines.append(f"- {field}: {rows[:3]}")
 
     lines.extend(
         [
@@ -225,6 +249,7 @@ def run_iteration_pipeline(
         "target_count": len(targets),
         "tracking_metrics": metrics,
         "summary": summary_payload.get("summary", {}),
+        "forward_group_summary": summary_payload.get("forward_group_summary", {}),
     }
     result_e = {
         "trade_date": trade_date,

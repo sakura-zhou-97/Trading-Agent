@@ -1496,6 +1496,88 @@ def _load_json_safe(path: Path) -> dict:
         return {}
 
 
+def _render_daily_report_dashboard(report: dict, trade_date: str) -> None:
+    summary_payload = report.get("summary", {}) if isinstance(report, dict) else {}
+    console.print(Panel(f"[bold]Trading Dashboard[/bold]\nDate: {trade_date}\nSource: R_daily_report.json", border_style="cyan"))
+
+    summary = Table(title="Daily Report Summary", box=box.SIMPLE)
+    summary.add_column("Metric")
+    summary.add_column("Value")
+    summary.add_row("Market State", str(summary_payload.get("market_state", "unknown")))
+    summary.add_row("Market Score", str(summary_payload.get("market_score", "unknown")))
+    summary.add_row("Candidate Count", str(summary_payload.get("candidate_count", 0)))
+    summary.add_row("S/A Key Opportunities", str(summary_payload.get("key_opportunity_count", 0)))
+    summary.add_row("Trade Plans", str(summary_payload.get("trade_plan_count", 0)))
+    summary.add_row("Blocked Plans", str(summary_payload.get("blocked_plan_count", 0)))
+    summary.add_row("Main Risk", str(summary_payload.get("main_risk", "")))
+    console.print(summary)
+
+    sector_table = Table(title="Sector Context", box=box.MINIMAL_DOUBLE_HEAD)
+    sector_table.add_column("Rank")
+    sector_table.add_column("Sector")
+    sector_table.add_column("Score")
+    sector_table.add_column("State")
+    sector_table.add_column("Count")
+    sector_rankings = report.get("sector_rankings", [])
+    if not isinstance(sector_rankings, list):
+        sector_rankings = []
+    for item in sector_rankings[:8]:
+        sector_table.add_row(
+            str(item.get("sector_rank", "")),
+            str(item.get("sector", "")),
+            str(item.get("sector_score", "")),
+            str(item.get("sector_state", "")),
+            str(item.get("sector_count", "")),
+        )
+    console.print(sector_table)
+
+    opportunity_table = Table(title="S/A Key Opportunities", box=box.MINIMAL_DOUBLE_HEAD)
+    opportunity_table.add_column("Symbol")
+    opportunity_table.add_column("Name")
+    opportunity_table.add_column("Grade")
+    opportunity_table.add_column("Score")
+    opportunity_table.add_column("Sector")
+    opportunity_table.add_column("Risk Penalty")
+    key_opportunities = report.get("key_opportunities", [])
+    if not isinstance(key_opportunities, list):
+        key_opportunities = []
+    for item in key_opportunities[:8]:
+        opportunity_table.add_row(
+            str(item.get("symbol", "")),
+            str(item.get("name", "")),
+            str(item.get("grade", "")),
+            str(item.get("total_score", "")),
+            str(item.get("sector", "")),
+            str(item.get("risk_penalty", "")),
+        )
+    console.print(opportunity_table)
+
+    plan_table = Table(title="Trade Plans", box=box.MINIMAL)
+    plan_table.add_column("Symbol")
+    plan_table.add_column("Grade")
+    plan_table.add_column("Status")
+    plan_table.add_column("Max Position")
+    plan_table.add_column("First Condition")
+    trade_plans = report.get("trade_plans", [])
+    if not isinstance(trade_plans, list):
+        trade_plans = []
+    for item in trade_plans[:8]:
+        entry_conditions = item.get("entry_conditions", []) if isinstance(item.get("entry_conditions"), list) else []
+        max_position = item.get("max_position_pct", 0)
+        try:
+            max_position_text = f"{float(max_position) * 100:.2f}%"
+        except Exception:
+            max_position_text = str(max_position)
+        plan_table.add_row(
+            str(item.get("symbol", "")),
+            str(item.get("grade", "")),
+            str(item.get("plan_status", "")),
+            max_position_text,
+            str(entry_conditions[0] if entry_conditions else "")[:48],
+        )
+    console.print(plan_table)
+
+
 @app.command("dashboard")
 def dashboard(
     trade_date: str = typer.Option(
@@ -1505,6 +1587,11 @@ def dashboard(
 ):
     """CLI可视化面板（MVP）：展示筛选与迭代关键指标。"""
     root = Path(DEFAULT_CONFIG["results_dir"])
+    r = _load_json_safe(root / "screener" / trade_date / "R_daily_report.json")
+    if r:
+        _render_daily_report_dashboard(r, trade_date)
+        return
+
     a = _load_json_safe(root / "screener" / trade_date / "A_candidates.json")
     b = _load_json_safe(root / "screener" / trade_date / "B_sector_calibration.json")
     c = _load_json_safe(root / "screener" / trade_date / "C_ai_analysis_with_cards.json")

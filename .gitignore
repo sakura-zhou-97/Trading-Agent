@@ -222,5 +222,10 @@ __marimo__/
 results/
 y/
 
+# Local MCP runtimes (generated, do not commit)
+tools/node-v*/
+tools/*.zip
+tools/lark-mcp-runtime/
+
 # Optional: keep one sample for CI/docs (uncomment to track)
 # !results/.gitkeep

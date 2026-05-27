@@ -36,6 +36,21 @@ class TrackingMetric:
     decision_conclusion_type: str
     decision_evidence_chain: List[str]
     decision_info_gaps: List[str]
+    scoring_profile: str
+    opportunity_grade: str
+    opportunity_score: Optional[float]
+    strategy_type: str
+    risk_penalty: Optional[float]
+    risk_bucket: str
+    sector_state: str
+    plan_status: str
+    entry_triggered: str
+    future_1d_return_pct: Optional[float]
+    future_5d_return_pct: Optional[float]
+    future_10d_return_pct: Optional[float]
+    future_20d_return_pct: Optional[float]
+    max_gain_pct: Optional[float]
+    max_drawdown_pct: Optional[float]
 
 
 def _parse_csv(raw: str) -> pd.DataFrame:
@@ -131,6 +146,18 @@ def _compute_mdd(base: float, closes: List[float]) -> Optional[float]:
     return round((min_close / base - 1.0) * 100.0, 3)
 
 
+def _compute_max_gain(base: float, highs: List[float]) -> Optional[float]:
+    if base <= 0 or not highs:
+        return None
+    return round((max(highs) / base - 1.0) * 100.0, 3)
+
+
+def _return_at_horizon(base: float, closes: List[float], horizon: int) -> Optional[float]:
+    if len(closes) < horizon:
+        return None
+    return _pct_change(base, closes[horizon - 1])
+
+
 def _next_dates(df: pd.DataFrame, source_date: str, n: int = 3) -> List[pd.Series]:
     if df.empty or "Date" not in df.columns:
         return []
@@ -170,6 +197,8 @@ def load_tracking_targets(results_dir: str, trade_date: str, lookback_days: int 
     for d in prev_dates:
         b_path = Path(results_dir) / "screener" / d / "C_ai_analysis_with_cards.json"
         c_path = Path(results_dir) / "screener" / d / "B_sector_calibration.json"
+        o_path = Path(results_dir) / "screener" / d / "O_opportunity_scores.json"
+        p_path = Path(results_dir) / "screener" / d / "P_trade_plans.json"
         if not c_path.exists():
             continue
         b_map: Dict[str, Dict] = {}
@@ -177,6 +206,16 @@ def load_tracking_targets(results_dir: str, trade_date: str, lookback_days: int 
             b_obj = _load_json(b_path)
             for dc in b_obj.get("decision_cards", []):
                 b_map[str(dc.get("symbol", "")).strip()] = dc
+        o_map: Dict[str, Dict] = {}
+        if o_path.exists():
+            o_obj = _load_json(o_path)
+            for opportunity in o_obj.get("opportunities", []):
+                o_map[str(opportunity.get("symbol", "")).strip()] = opportunity
+        p_map: Dict[str, Dict] = {}
+        if p_path.exists():
+            p_obj = _load_json(p_path)
+            for plan in p_obj.get("plans", []):
+                p_map[str(plan.get("symbol", "")).strip()] = plan
         obj = _load_json(c_path)
         for item in obj.get("calibrated_analysis_list", []):
             symbol = str(item.get("symbol", "")).strip()
@@ -189,8 +228,41 @@ def load_tracking_targets(results_dir: str, trade_date: str, lookback_days: int 
                 "source_trade_date": d,
                 "decision_snapshot": item,
                 "decision_card": b_map.get(symbol, {}),
+                "opportunity_snapshot": o_map.get(symbol, {}),
+                "trade_plan": p_map.get(symbol, {}),
             }
     return list(targets_map.values())
+
+
+def _risk_bucket(risk_penalty: Optional[float]) -> str:
+    if risk_penalty is None:
+        return "unknown"
+    if risk_penalty >= 10.0:
+        return "high"
+    if risk_penalty >= 6.0:
+        return "medium"
+    return "low"
+
+
+def _entry_triggered(source_close: float, rows: List[pd.Series], plan: Dict) -> str:
+    if not plan:
+        return "unknown"
+    if str(plan.get("plan_status", "")) == "blocked":
+        return "unknown"
+    if source_close <= 0 or not rows:
+        return "unknown"
+
+    text = " ".join(str(x) for x in plan.get("entry_conditions", []) or [])
+    highs = [_safe_float(row.get("High")) or _safe_float(row.get("Close")) for row in rows]
+    closes = [_safe_float(row.get("Close")) for row in rows]
+    max_high = max(highs) if highs else 0.0
+    max_close = max(closes) if closes else 0.0
+
+    if "突破" in text or "平台" in text:
+        return "true" if max_high >= source_close * 1.02 or max_close >= source_close * 1.02 else "false"
+    if "回踩" in text or "MA10" in text or "MA5" in text:
+        return "true" if max_high >= source_close * 1.01 else "false"
+    return "true" if max_high >= source_close * 1.02 else "false"
 
 
 def track_three_day_metrics(targets: List[Dict]) -> List[Dict]:
@@ -199,7 +271,7 @@ def track_three_day_metrics(targets: List[Dict]) -> List[Dict]:
         symbol = target["symbol"]
         source_date = target["source_trade_date"]
         start = source_date
-        end = (datetime.strptime(source_date, "%Y-%m-%d") + timedelta(days=10)).strftime("%Y-%m-%d")
+        end = (datetime.strptime(source_date, "%Y-%m-%d") + timedelta(days=45)).strftime("%Y-%m-%d")
         try:
             raw = china_provider.get_china_stock_data(symbol, start, end)
             df = _parse_csv(raw)
@@ -218,14 +290,22 @@ def track_three_day_metrics(targets: List[Dict]) -> List[Dict]:
                 source_close = _safe_float(df.iloc[0].get("Close"))
                 source_volume = _safe_float(df.iloc[0].get("Volume"))
 
-        rows = _next_dates(df, source_date, n=3)
+        rows = _next_dates(df, source_date, n=20)
         closes = [_safe_float(r.get("Close")) for r in rows]
+        highs = [_safe_float(r.get("High")) or _safe_float(r.get("Close")) for r in rows]
+        lows = [_safe_float(r.get("Low")) or _safe_float(r.get("Close")) for r in rows]
         vols = [_safe_float(r.get("Volume")) for r in rows]
 
         t1 = _pct_change(source_close, closes[0]) if len(closes) >= 1 else None
         t2 = _pct_change(source_close, closes[1]) if len(closes) >= 2 else None
         t3 = _pct_change(source_close, closes[2]) if len(closes) >= 3 else None
-        mdd = _compute_mdd(source_close, closes)
+        mdd = _compute_mdd(source_close, closes[:3])
+        max_gain = _compute_max_gain(source_close, highs)
+        max_drawdown = _compute_mdd(source_close, lows)
+        future_1d = _return_at_horizon(source_close, closes, 1)
+        future_5d = _return_at_horizon(source_close, closes, 5)
+        future_10d = _return_at_horizon(source_close, closes, 10)
+        future_20d = _return_at_horizon(source_close, closes, 20)
 
         r1, tags1 = _reason_from_signals(
             t1,
@@ -256,6 +336,11 @@ def track_three_day_metrics(targets: List[Dict]) -> List[Dict]:
         big_drop = (mdd is not None and mdd <= -8.0)
         should_remove = bool(big_drop or consecutive_down)
         remove_reason = "3天内大跌" if big_drop else "连续下跌" if consecutive_down else ""
+        opportunity = target.get("opportunity_snapshot", {}) or {}
+        trade_plan = target.get("trade_plan", {}) or {}
+        decision_snapshot = target.get("decision_snapshot", {}) or {}
+        risk_penalty = opportunity.get("risk_penalty")
+        risk_penalty_value = _safe_float(risk_penalty) if risk_penalty is not None else None
 
         metric = TrackingMetric(
             symbol=symbol,
@@ -278,6 +363,21 @@ def track_three_day_metrics(targets: List[Dict]) -> List[Dict]:
             decision_conclusion_type=str(target.get("decision_card", {}).get("conclusion_type", "")),
             decision_evidence_chain=list(target.get("decision_card", {}).get("evidence_chain", [])[:3]),
             decision_info_gaps=list(target.get("decision_card", {}).get("info_gaps", [])[:3]),
+            scoring_profile=str(opportunity.get("scoring_profile", "")),
+            opportunity_grade=str(opportunity.get("grade", "")),
+            opportunity_score=_safe_float(opportunity.get("total_score")) if opportunity.get("total_score") is not None else None,
+            strategy_type=str(opportunity.get("strategy_type", trade_plan.get("strategy_type", ""))),
+            risk_penalty=risk_penalty_value,
+            risk_bucket=_risk_bucket(risk_penalty_value),
+            sector_state=str(opportunity.get("sector_state", decision_snapshot.get("sector_state", ""))),
+            plan_status=str(trade_plan.get("plan_status", "")),
+            entry_triggered=_entry_triggered(source_close, rows, trade_plan),
+            future_1d_return_pct=future_1d,
+            future_5d_return_pct=future_5d,
+            future_10d_return_pct=future_10d,
+            future_20d_return_pct=future_20d,
+            max_gain_pct=max_gain,
+            max_drawdown_pct=max_drawdown,
         )
         metrics.append(asdict(metric))
     return metrics

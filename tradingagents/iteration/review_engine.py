@@ -50,11 +50,73 @@ def _estimate_filter_impact(tracking_metrics: List[Dict], symbol_set: set[str]) 
     }
 
 
+def _avg_metric(rows: List[Dict], key: str):
+    vals = [x.get(key) for x in rows if x.get(key) is not None]
+    return round(mean(vals), 3) if vals else None
+
+
+def _entry_trigger_rate(rows: List[Dict]):
+    vals = [x.get("entry_triggered") for x in rows if x.get("entry_triggered") in {"true", "false"}]
+    if not vals:
+        return None
+    return round(sum(1 for x in vals if x == "true") / len(vals), 3)
+
+
+def evaluate_forward_groups(tracking_metrics: List[Dict]) -> Dict:
+    """Evaluate forward metrics by grade, strategy, risk, sector, plan, and profile."""
+    group_fields = [
+        "opportunity_grade",
+        "strategy_type",
+        "risk_bucket",
+        "sector_state",
+        "plan_status",
+        "scoring_profile",
+    ]
+    result: Dict[str, List[Dict]] = {}
+    for field in group_fields:
+        buckets: Dict[str, List[Dict]] = {}
+        for metric in tracking_metrics:
+            value = str(metric.get(field, "") or "unknown")
+            buckets.setdefault(value, []).append(metric)
+        rows: List[Dict] = []
+        for value, items in buckets.items():
+            rows.append(
+                {
+                    "group": value,
+                    "count": len(items),
+                    "avg_future_1d_return_pct": _avg_metric(items, "future_1d_return_pct"),
+                    "avg_future_5d_return_pct": _avg_metric(items, "future_5d_return_pct"),
+                    "avg_future_10d_return_pct": _avg_metric(items, "future_10d_return_pct"),
+                    "avg_future_20d_return_pct": _avg_metric(items, "future_20d_return_pct"),
+                    "avg_max_gain_pct": _avg_metric(items, "max_gain_pct"),
+                    "avg_max_drawdown_pct": _avg_metric(items, "max_drawdown_pct"),
+                    "entry_trigger_rate": _entry_trigger_rate(items),
+                }
+            )
+        rows.sort(key=lambda x: (x.get("count", 0), x.get("avg_future_5d_return_pct") or -999), reverse=True)
+        result[field] = rows
+    return result
+
+
+def _weak_forward_groups(forward_groups: Dict) -> List[Dict]:
+    weak: List[Dict] = []
+    for field, rows in forward_groups.items():
+        for row in rows:
+            if int(row.get("count", 0)) < 3:
+                continue
+            avg_5d = row.get("avg_future_5d_return_pct")
+            avg_mdd = row.get("avg_max_drawdown_pct")
+            if (avg_5d is not None and avg_5d < 0) or (avg_mdd is not None and avg_mdd <= -6.0):
+                weak.append({"field": field, **row})
+    return weak[:8]
+
+
 def generate_patch_suggestions(tracking_metrics: List[Dict], min_valid_t3_samples: int = 5) -> Dict:
     """Generate rule/prompt patch proposals from rolling 3-day tracking."""
     if not tracking_metrics:
         return {
             "summary": {"sample_size": 0},
+            "forward_group_summary": {},
             "rule_patch_suggestions": [],
             "prompt_patch_suggestions": [],
         }
@@ -73,6 +135,8 @@ def generate_patch_suggestions(tracking_metrics: List[Dict], min_valid_t3_sample
 
     rule_suggestions: List[Dict] = []
     prompt_suggestions: List[Dict] = []
+    forward_group_summary = evaluate_forward_groups(tracking_metrics)
+    weak_groups = _weak_forward_groups(forward_group_summary)
 
     if avg_mdd <= -6.0:
         trigger = [
@@ -154,6 +218,28 @@ def generate_patch_suggestions(tracking_metrics: List[Dict], min_valid_t3_sample
             )
         )
 
+    if weak_groups:
+        rule_suggestions.append(
+            _build_proposal(
+                "rule",
+                "按分组证据收紧弱势组合",
+                "建议优先审查表现较弱的 grade/strategy/risk/sector/plan 分组，必要时提高入选门槛或降低计划状态。",
+                {"weak_forward_groups": weak_groups},
+                confidence=0.69,
+                trigger_samples=weak_groups,
+            )
+        )
+        prompt_suggestions.append(
+            _build_proposal(
+                "prompt",
+                "要求决策卡引用前向验证弱分组",
+                "建议 Prompt 在类似弱分组样本出现时，显式提示历史前向验证表现和风险扣分原因。",
+                {"weak_forward_groups": weak_groups},
+                confidence=0.63,
+                trigger_samples=weak_groups,
+            )
+        )
+
     if not has_valid_t3:
         rule_suggestions.append(
             _build_proposal(
@@ -211,6 +297,7 @@ def generate_patch_suggestions(tracking_metrics: List[Dict], min_valid_t3_sample
 
     return {
         "summary": summary,
+        "forward_group_summary": forward_group_summary,
         "rule_patch_suggestions": rule_suggestions,
         "prompt_patch_suggestions": prompt_suggestions,
     }
@@ -226,8 +313,26 @@ def render_daily_review_card(track_summary: Dict, suggestions: Dict) -> str:
         f"- 3天平均回撤(MDD): {track_summary.get('avg_mdd_3d_pct')}",
         f"- 剔除数量: {track_summary.get('remove_count')}",
         "",
+        "## Forward Validation Groups",
+    ]
+    group_summary = suggestions.get("forward_group_summary", {})
+    if group_summary:
+        for field, rows in group_summary.items():
+            lines.append(f"### {field}")
+            for row in rows[:5]:
+                lines.append(
+                    f"- {row.get('group')}: n={row.get('count')}, "
+                    f"avg5d={row.get('avg_future_5d_return_pct')}, "
+                    f"mdd={row.get('avg_max_drawdown_pct')}, "
+                    f"entry_rate={row.get('entry_trigger_rate')}"
+                )
+    else:
+        lines.append("- 暂无分组数据。")
+    lines.extend([
+        "",
         "## Rule Patch Suggestions",
     ]
+    )
     for idx, p in enumerate(suggestions.get("rule_patch_suggestions", []), start=1):
         lines.append(f"{idx}. {p['title']} | 置信度={p['confidence']} | {p['suggestion']}")
     lines.append("")

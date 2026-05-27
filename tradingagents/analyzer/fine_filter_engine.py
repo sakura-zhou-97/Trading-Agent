@@ -71,6 +71,8 @@ def _fallback_decision(item: Dict) -> DecisionCard:
     sector = str(item.get("sector", "")).strip() or "unknown_sector"
     sector_day_strength = item.get("sector_day_strength")
     sector_trend_3d = item.get("sector_trend_3d")
+    sector_score = item.get("sector_score")
+    sector_state = item.get("sector_state")
     sector_multiplier = item.get("sector_multiplier")
     leader_status = str(item.get("sector_leader_status", "")).strip() or "未知"
     if change_pct >= 8.0 and last_close >= ma5 >= ma10:
@@ -92,7 +94,8 @@ def _fallback_decision(item: Dict) -> DecisionCard:
             f"趋势标签为{trend}，收盘与均线关系为 Close={last_close} MA5={ma5} MA10={ma10}",
             (
                 f"板块{sector}强度参考：day_strength={sector_day_strength}, "
-                f"trend_3d={sector_trend_3d}, multiplier={sector_multiplier}, leader_status={leader_status}"
+                f"trend_3d={sector_trend_3d}, sector_score={sector_score}, "
+                f"sector_state={sector_state}, multiplier={sector_multiplier}, leader_status={leader_status}"
             ),
         ],
         tradability="主线/分支交易性中等，需结合当日板块强弱确认",
@@ -113,6 +116,11 @@ def _build_sector_payload(item: Dict, sector_context_by_symbol: Dict[str, Dict] 
     # Prefer explicit context map; fallback to fields merged in item.
     payload = {
         "sector": from_map.get("sector", item.get("sector", "")),
+        "sector_adapter": from_map.get("sector_adapter", item.get("sector_adapter", "industry")),
+        "sector_score": from_map.get("sector_score", item.get("sector_score")),
+        "sector_state": from_map.get("sector_state", item.get("sector_state")),
+        "sector_rank": from_map.get("sector_rank", item.get("sector_rank")),
+        "sector_count": from_map.get("sector_count", item.get("sector_count")),
         "sector_day_strength": from_map.get("sector_day_strength", item.get("sector_day_strength")),
         "sector_trend_3d": from_map.get("sector_trend_3d", item.get("sector_trend_3d")),
         "sector_multiplier": from_map.get("sector_multiplier", item.get("sector_multiplier")),
